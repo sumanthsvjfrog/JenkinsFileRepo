@@ -1,0 +1,125 @@
+def ART_DOCKER_REGISTRY = "test.jfrog.io/bmc-docker-virt" 
+def DOCKER_IMAGE_NAME = "my-app" 
+def DOCKER_TAG = "${env.BUILD_NUMBER}" 
+def BUILD_INFO_NAME = "${env.JOB_NAME}"
+def BUILD_INFO_NUMBER = DOCKER_TAG
+def SOURCE_REPO = "bmc-docker-virt" 
+def STAGING_REPO = "bmc-docker-qa2" 
+def DISTRIBUTION_RULE_NAME = "my-distribution-rule" 
+
+def BITBUCKET_REPO_URL_PATH = 'http://<bitbucket_url>/scm/DEM/dockerrepo.git'
+def BITBUCKET_BRANCH = 'main' 
+
+pipeline {
+    agent { label 'master' }
+    
+    tools {
+        jfrog 'psblr' 
+    }
+
+    environment {
+        // Build Info Variables
+        JFROG_CLI_BUILD_NAME = "${env.JOB_NAME}"
+        JFROG_CLI_BUILD_NUMBER = "${DOCKER_TAG}"
+        
+        BITBUCKET_PAT_CREDENTIAL_ID = 'JF_BIT_TOKEN' 
+        BITBUCKET_USER = 'JF_BIT_USER' 
+        
+        JFROG_URL_CREDENTIAL_ID = 'JF_URL' 
+        JFROG_TOKEN_CREDENTIAL_ID = 'JF_ACCESS_TOKEN' 
+    }
+
+    stages {
+        
+stage('Checkout Bitbucket Repo') {
+    steps {
+        withCredentials([
+            string(credentialsId: "${BITBUCKET_PAT_CREDENTIAL_ID}", variable: 'BB_TOKEN'),
+            string(credentialsId: "${BITBUCKET_USER}", variable: 'BB_USER')
+        ]) {
+            script {
+                // URL-encode credentials if they contain special characters
+                def encodedUser = URLEncoder.encode(BB_USER, "UTF-8")
+                def encodedToken = URLEncoder.encode(BB_TOKEN, "UTF-8")
+                sh 'rm -rf dockerrepo'
+                sh """
+                    git clone http://${encodedUser}:${encodedToken}@<bitbucket_url>/scm/DEM/dockerrepo.git -b main
+                """
+            }
+        }
+    }
+}
+stage('Docker Login to Artifactory') {
+    steps {
+        withCredentials([
+            string(credentialsId: 'JF_DOCKER_USER', variable: 'DOCKER_USER'),
+            string(credentialsId: 'JF_DOCKER_PASS', variable: 'DOCKER_PASS')
+        ]) {
+            sh """
+                echo "${DOCKER_PASS}" | docker login psblr.jfrog.io -u "${DOCKER_USER}" --password-stdin
+            """
+        }
+    }
+}
+  
+  stage('Debug Workspace') {
+    steps {
+        sh 'echo "=== WORKSPACE ==="'
+        sh 'pwd'
+        sh 'ls -al'
+        sh 'echo "==================="'
+    }
+}      
+
+        stage('Build, Push, Promote & Distribute') {
+            steps {
+                script {
+                    withCredentials([
+                        string(credentialsId: env.JFROG_URL_CREDENTIAL_ID, variable: 'JFROG_URL_BASE'),
+                        string(credentialsId: env.JFROG_TOKEN_CREDENTIAL_ID, variable: 'JFROG_AUTH_TOKEN')
+                    ]) {
+                        
+                        jf "c show" // Check if existing server config is present
+                        def JFROG_SERVER_ID = 'psblr'
+
+                        // --- BUILD ---
+                        echo "Building Docker image: ${DOCKER_IMAGE_NAME}:${DOCKER_TAG}"
+                        
+                        def remoteImage = "${ART_DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}:${DOCKER_TAG}"
+                        jf "docker build -t ${remoteImage} -f dockerrepo/Dockerfile dockerrepo --build-name ${JFROG_CLI_BUILD_NAME} --build-number ${JFROG_CLI_BUILD_NUMBER} --no-cache"
+                        
+                        // --- TAG & PUSH ---
+                        
+                        echo "Pushing image and capturing Build-Info using jf rt docker-push"
+                        jf "docker push ${remoteImage} --build-name=${JFROG_CLI_BUILD_NAME} --build-number=${JFROG_CLI_BUILD_NUMBER} --server-id=${JFROG_SERVER_ID}"
+                        
+                        // --- PUBLISH Build-Info ---
+                        echo "Publishing complete Build Info to Artifactory"
+                        jf "rt build-publish ${JFROG_CLI_BUILD_NAME} ${JFROG_CLI_BUILD_NUMBER} --server-id=${JFROG_SERVER_ID}"
+                        
+                        // --- PROMOTE Image ---
+                        echo "Promoting build ${BUILD_INFO_NUMBER} from ${SOURCE_REPO} to ${STAGING_REPO}"
+                       // jf "rt build-promote ${JFROG_CLI_BUILD_NAME} ${JFROG_CLI_BUILD_NUMBER} ${STAGING_REPO} --status=qa --server-id=${JFROG_SERVER_ID} --copy"
+                        
+                        // --- Create RBv2 from Build ---
+                        jf "rbc --build-name=${JFROG_CLI_BUILD_NAME} --build-number=${JFROG_CLI_BUILD_NUMBER} --signing-key=sumgpg2 bmcjenkrbv2 ${JFROG_CLI_BUILD_NUMBER}"
+                    
+                        // ----Promote RBv2----------
+                        jf "rbp --signing-key=sumgpg2 --include-repos=${STAGING_REPO} bmcjenkrbv2 ${JFROG_CLI_BUILD_NUMBER} QA"
+                        
+                        // --- DISTRIBUTE Image ---
+                        jf "rbd --create-repo  --site psblredge1 bmcjenkrbv2 ${JFROG_CLI_BUILD_NUMBER}"
+                        //echo "Distributing promoted build using Distribution Rule: ${DISTRIBUTION_RULE_NAME}"
+                        //jf "ds build-distribute ${JFROG_CLI_BUILD_NAME} ${JFROG_CLI_BUILD_NUMBER} ${DISTRIBUTION_RULE_NAME} --server-id=${JFROG_SERVER_ID}"
+                        
+                        // Clean up the temporary server configuration
+                        jf "c rm ${JFROG_SERVER_ID}"
+                        sh """
+                        docker rmi -f ${remoteImage}
+                        """
+                    }
+                }
+            }
+        }
+    }
+}
