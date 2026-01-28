@@ -1,0 +1,78 @@
+pipeline {
+  agent any
+    environment {
+        JURL = 'https://test.jfrog.io/'
+        RT_URL = 'https://test.jfrog.io/artifactory'
+        MVN_REPO = ‘test-virt’
+        JFROG_ACCESS_TOKEN = credentials(‘testcred’) // Pulls the access token from Jenkins credentials
+       
+        
+    }
+  tools {
+         maven "Maven-3.9.9" //Update this field
+         jfrog 'psblrcli’ //Update this field
+   
+  }
+    
+  stages {
+        stage ('JFrog CLI Check') {
+            steps {
+                
+                 // Show the installed version of JFrog CLI.
+                sh 'rm -f ~/.jfrog/jfrog-cli.conf.v6'
+                jf 'c show'
+            }
+        }
+            stage('Git Clone') {
+      steps {
+          dir('complete') {
+            checkout scmGit(branches: [[name: '*/main']], extensions: [], userRemoteConfigs: [[url: 'https://github.com/test/testrepo.git']])
+        }
+      }
+    }
+        stage ('Config MVN'){
+            steps {
+                dir('complete'){
+                     jf "mvnc --global --repo-resolve-releases ${MVN_REPO} --repo-resolve-snapshots ${MVN_REPO} --repo-deploy-releases ${MVN_REPO} --repo-deploy-snapshots ${MVN_REPO}"
+                }
+            }
+    }
+    stage('Audit Scan') {
+      steps {
+        dir('complete') {
+          jf 'audit'
+        }
+      }
+    }
+    stage('Build MVN') {
+      steps {
+          dir('complete') {
+              script {
+                 jf "mvn clean install --build-name=${env.JOB_NAME} --build-number=${env.BUILD_NUMBER}"
+              }
+        }
+      }
+    }  
+        stage('Build-info-Collection') {
+      steps {
+          dir('complete') {
+              script {
+             jf "rt bce ${env.JOB_NAME} ${env.BUILD_NUMBER}"
+             jf "rt bag ${env.JOB_NAME} ${env.BUILD_NUMBER}"
+              }
+        }
+      }
+    }
+        stage('Build-info-publish') {
+      steps {
+          dir('complete') {
+              script {
+              jf "rt bp ${env.JOB_NAME} ${env.BUILD_NUMBER}"
+              }
+      }
+      }
+    }
+
+  }
+  
+}
